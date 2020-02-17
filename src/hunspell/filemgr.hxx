@@ -73,11 +73,12 @@
 #define FILEMGR_HXX_
 
 #include "hunzip.hxx"
+#include "datamgr.hxx"
 #include <stdio.h>
 #include <string>
 #include <fstream>
 
-class FileMgr {
+class FileMgr : public DataMgr {
  private:
   FileMgr(const FileMgr&);
   FileMgr& operator=(const FileMgr&);
@@ -85,14 +86,11 @@ class FileMgr {
  protected:
   std::ifstream fin;
   Hunzip* hin;
-  char in[BUFSIZE + 50];  // input buffer
-  int fail(const char* err, const char* par);
-  int linenum;
 
  public:
   FileMgr(const char* filename, const char* key = NULL);
   ~FileMgr();
-  bool getline(std::string&);
-  int getlinenum();
+  bool getline(std::string&) override;
+  bool is_ready() const override;
 };
 #endif

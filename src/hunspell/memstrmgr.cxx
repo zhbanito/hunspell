@@ -72,47 +72,36 @@
 #include <string.h>
 #include <stdio.h>
 
-#include "filemgr.hxx"
+#include "memstrmgr.hxx"
 #include "csutil.hxx"
 
-FileMgr::FileMgr(const char* file, const char* key) : hin(NULL) {
-  if (key == nullptr)
-    myopen(fin, file, std::ios_base::in);
-  if (!fin.is_open()) {
-    // check hzipped file
-    std::string st(file);
-    st.append(HZIP_EXTENSION);
-    hin = new Hunzip(st.c_str(), key);
-  } else {
+MemStrMgr::MemStrMgr(const char* in_data, int in_data_len) {
+  if (in_data_len <= 0)
+    fail("error: data is empty\n", nullptr);
+  //copy string for further using
+  data.assign(in_data, in_data_len);
+  sin.str(data);
+  if (is_ready()) {
     std::string first_line;
-    if (static_cast<bool>(std::getline(fin, first_line))) {
+    if(static_cast<bool>(std::getline(sin, first_line))) {
       int starting_file_offset = 
         is_string_start_with(first_line, "\xEF\xBB\xBF") ? 3 : 0;
-      fin.seekg(starting_file_offset);
+      sin.seekg(starting_file_offset);
     }
   }
-  
-  if (!is_ready())
-    fail(MSG_OPEN, file);
 }
 
-FileMgr::~FileMgr() {
-  if (hin != nullptr)
-    delete hin;
+MemStrMgr::~MemStrMgr() {
+
 }
 
-bool FileMgr::getline(std::string& dest) {
-  bool result = false;
-  if (fin.is_open()) {
-    result = static_cast<bool>(std::getline(fin, dest));
-  } else if (hin != nullptr && hin->is_open()) {
-    result = hin->getline(dest);
-  }
+bool MemStrMgr::getline(std::string& dest) {
+  bool result = static_cast<bool>(std::getline(sin, dest));
   if (result)
     ++linenum;
   return result;
 }
 
-bool FileMgr::is_ready() const {
-  return fin.is_open() || (hin != nullptr && hin->is_open());
+bool MemStrMgr::is_ready() const {
+  return data.size() > 0;
 }

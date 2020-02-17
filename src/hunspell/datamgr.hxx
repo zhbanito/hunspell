@@ -68,51 +68,22 @@
  * SUCH DAMAGE.
  */
 
-#include <stdlib.h>
-#include <string.h>
+/* abstract manager class */
+#ifndef DATAMGR_HXX_
+#define DATAMGR_HXX_
+
+#include <string>
 #include <stdio.h>
 
-#include "filemgr.hxx"
-#include "csutil.hxx"
+class DataMgr {
+ protected:  
+  int fail(const char* err, const char* par) const;
+  int linenum;
 
-FileMgr::FileMgr(const char* file, const char* key) : hin(NULL) {
-  if (key == nullptr)
-    myopen(fin, file, std::ios_base::in);
-  if (!fin.is_open()) {
-    // check hzipped file
-    std::string st(file);
-    st.append(HZIP_EXTENSION);
-    hin = new Hunzip(st.c_str(), key);
-  } else {
-    std::string first_line;
-    if (static_cast<bool>(std::getline(fin, first_line))) {
-      int starting_file_offset = 
-        is_string_start_with(first_line, "\xEF\xBB\xBF") ? 3 : 0;
-      fin.seekg(starting_file_offset);
-    }
-  }
-  
-  if (!is_ready())
-    fail(MSG_OPEN, file);
-}
-
-FileMgr::~FileMgr() {
-  if (hin != nullptr)
-    delete hin;
-}
-
-bool FileMgr::getline(std::string& dest) {
-  bool result = false;
-  if (fin.is_open()) {
-    result = static_cast<bool>(std::getline(fin, dest));
-  } else if (hin != nullptr && hin->is_open()) {
-    result = hin->getline(dest);
-  }
-  if (result)
-    ++linenum;
-  return result;
-}
-
-bool FileMgr::is_ready() const {
-  return fin.is_open() || (hin != nullptr && hin->is_open());
-}
+ public:
+  DataMgr();
+  virtual bool getline(std::string&) = 0;
+  virtual int getlinenum() const;
+  virtual bool is_ready() const = 0;
+};
+#endif
