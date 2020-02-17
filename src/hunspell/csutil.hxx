@@ -324,4 +324,8 @@ inline char* HENTRY_FIND(struct hentry* h,
   return (HENTRY_DATA(h) ? strstr(HENTRY_DATA(h), p) : NULL);
 }
 
+inline bool is_string_start_with(const std::string& str, const std::string& substr) {
+  return str.compare(0, substr.size(), substr) == 0;
+}
+
 #endif
