@@ -42,7 +42,9 @@
 #include <ctype.h>
 #include <string.h>
 #include <string>
+#ifndef WIN32
 #include <unistd.h>
+#endif
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>

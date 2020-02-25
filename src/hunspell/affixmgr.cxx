@@ -78,18 +78,26 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include <sstream>
 
 #include "affixmgr.hxx"
 #include "affentry.hxx"
 #include "langnum.hxx"
+#include "memstrmgr.hxx"
 
 #include "csutil.hxx"
 
 AffixMgr::AffixMgr(const char* affpath,
                    const std::vector<HashMgr*>& ptr,
-                   const char* key)
+                   const char* key, 
+                   int aff_data_len)
   : alldic(ptr)
-  , pHMgr(ptr[0]) {
+  , numaliasf(0)
+  , aliasf(NULL)
+  , aliasflen(0)
+  , numaliasm(0)
+  , aliasm(NULL)
+  , aff_flag_mode(aff_flag_type::CHAR) {
 
   // register hash manager and load affix data from aff file
   csconv = NULL;
@@ -167,9 +175,16 @@ AffixMgr::AffixMgr(const char* affpath,
     contclasses[j] = 0;
   }
 
-  if (parse_file(affpath, key)) {
-    HUNSPELL_WARNING(stderr, "Failure loading aff file %s\n", affpath);
+  if(aff_data_len == 0) {
+    if (parse_file(affpath, key)) {
+      HUNSPELL_WARNING(stderr, "Failure loading aff file %s\n", affpath);
+    }
+  } else {
+    if (parse_file(affpath, aff_data_len)) {
+      HUNSPELL_WARNING(stderr, "Failure loading aff memory\n");
+    }
   }
+  
 
   if (cpdmin == -1)
     cpdmin = MINCPDLEN;
@@ -223,7 +238,6 @@ AffixMgr::~AffixMgr() {
   FREE_FLAG(onlyincompound);
 
   cpdwordmax = 0;
-  pHMgr = NULL;
   cpdmin = 0;
   cpdmaxsyllable = 0;
   free_utf_tbl();
@@ -231,33 +245,48 @@ AffixMgr::~AffixMgr() {
 #ifdef MOZILLA_CLIENT
   delete[] csconv;
 #endif
+
+  if (aliasf) {
+    for (int j = 0; j < (numaliasf); j++)
+      free(aliasf[j]);
+    free(aliasf);
+    aliasf = NULL;
+    if (aliasflen) {
+      free(aliasflen);
+      aliasflen = NULL;
+    }
+  }
+  if (aliasm) {
+    for (int j = 0; j < (numaliasm); j++)
+      free(aliasm[j]);
+    free(aliasm);
+    aliasm = NULL;
+  }
 }
 
-void AffixMgr::finishFileMgr(FileMgr* afflst) {
-  delete afflst;
+int AffixMgr::parse_file(const char* affpath, const char* key) {
+  FileMgr file(affpath, key);
+  if(!file.is_ready())
+    return 1;
+  else
+    return parse_file(file);
+}
 
-  // convert affix trees to sorted list
-  process_pfx_tree_to_list();
-  process_sfx_tree_to_list();
+int AffixMgr::parse_file(const char* aff_data, int aff_data_len) {
+  MemStrMgr file(aff_data, aff_data_len);
+  if(!file.is_ready())
+    return 1;
+  else
+    return parse_file(file);
+
 }
 
 // read in aff file and build up prefix and suffix entry objects
-int AffixMgr::parse_file(const char* affpath, const char* key) {
+int AffixMgr::parse_file(DataMgr& afflst) {
 
   // checking flag duplication
   char dupflags[CONTSIZE];
   char dupflags_ini = 1;
-
-  // first line indicator for removing byte order mark
-  int firstline = 1;
-
-  // open the affix file
-  FileMgr* afflst = new FileMgr(affpath, key);
-  if (!afflst) {
-    HUNSPELL_WARNING(
-        stderr, "error: could not open affix description file %s\n", affpath);
-    return 1;
-  }
 
   // step one is to parse the affix file building up the internal
   // affix data structures
@@ -265,438 +294,298 @@ int AffixMgr::parse_file(const char* affpath, const char* key) {
   // read in each line ignoring any that do not
   // start with a known line type indicator
   std::string line;
-  while (afflst->getline(line)) {
+  bool is_good_parse = true;
+  while (afflst.getline(line) && is_good_parse) {
     mychomp(line);
 
-    /* remove byte order mark */
-    if (firstline) {
-      firstline = 0;
-      // Affix file begins with byte order mark: possible incompatibility with
-      // old Hunspell versions
-      if (line.compare(0, 3, "\xEF\xBB\xBF", 3) == 0) {
-        line.erase(0, 3);
-      }
-    }
-
-    /* parse in the keyboard string */
-    if (line.compare(0, 3, "KEY", 3) == 0) {
-      if (!parse_string(line, keystring, afflst->getlinenum())) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the try string */
-    if (line.compare(0, 3, "TRY", 3) == 0) {
-      if (!parse_string(line, trystring, afflst->getlinenum())) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
     /* parse in the name of the character set used by the .dict and .aff */
-    if (line.compare(0, 3, "SET", 3) == 0) {
-      if (!parse_string(line, encoding, afflst->getlinenum())) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-      if (encoding == "UTF-8") {
-        utf8 = 1;
+    if (is_string_start_with(line, "SET")) {
+      is_good_parse = parse_string(line, encoding, afflst.getlinenum());
+      if (is_good_parse && encoding == "UTF-8") {
+        utf8 = true;
 #ifndef OPENOFFICEORG
 #ifndef MOZILLA_CLIENT
         initialize_utf_tbl();
 #endif
 #endif
+      } else {
+        csconv = get_current_cs(encoding);
       }
+      
+    }
+
+    /* parse in the flag string */
+    else if (is_string_start_with(line, "FLAG")) {
+      if (aff_flag_mode != aff_flag_type::CHAR) {
+        HUNSPELL_WARNING(stderr,
+                         "error: line %d: multiple definitions of the FLAG "
+                         "affix file parameter\n",
+                         afflst.getlinenum());
+        is_good_parse = false;
+      }
+      else if (line.find("long") != std::string::npos)
+        aff_flag_mode = aff_flag_type::LONG;
+      else if (line.find("num") != std::string::npos)
+        aff_flag_mode = aff_flag_type::NUM;
+      else if (line.find("UTF-8") != std::string::npos)
+        aff_flag_mode = aff_flag_type::UNI;
+      if (aff_flag_mode == aff_flag_type::CHAR) {
+        HUNSPELL_WARNING(
+            stderr,
+            "error: line %d: FLAG needs `num', `long' or `UTF-8' parameter\n",
+            afflst.getlinenum());
+        is_good_parse = false;
+      }
+      else
+        is_good_parse = true;
     }
 
     /* parse COMPLEXPREFIXES for agglutinative languages with right-to-left
      * writing system */
-    if (line.compare(0, 15, "COMPLEXPREFIXES", 15) == 0)
-      complexprefixes = 1;
+    else if (is_string_start_with(line, "COMPLEXPREFIXES"))
+      complexprefixes = true;
 
-    /* parse in the flag used by the controlled compound words */
-    if (line.compare(0, 12, "COMPOUNDFLAG", 12) == 0) {
-      if (!parse_flag(line, &compoundflag, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by compound words */
-    if (line.compare(0, 13, "COMPOUNDBEGIN", 13) == 0) {
-      if (complexprefixes) {
-        if (!parse_flag(line, &compoundend, afflst)) {
-          finishFileMgr(afflst);
-          return 1;
-        }
-      } else {
-        if (!parse_flag(line, &compoundbegin, afflst)) {
-          finishFileMgr(afflst);
-          return 1;
-        }
-      }
-    }
-
-    /* parse in the flag used by compound words */
-    if (line.compare(0, 14, "COMPOUNDMIDDLE", 14) == 0) {
-      if (!parse_flag(line, &compoundmiddle, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by compound words */
-    if (line.compare(0, 11, "COMPOUNDEND", 11) == 0) {
-      if (complexprefixes) {
-        if (!parse_flag(line, &compoundbegin, afflst)) {
-          finishFileMgr(afflst);
-          return 1;
-        }
-      } else {
-        if (!parse_flag(line, &compoundend, afflst)) {
-          finishFileMgr(afflst);
-          return 1;
-        }
-      }
-    }
-
-    /* parse in the data used by compound_check() method */
-    if (line.compare(0, 15, "COMPOUNDWORDMAX", 15) == 0) {
-      if (!parse_num(line, &cpdwordmax, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag sign compounds in dictionary */
-    if (line.compare(0, 12, "COMPOUNDROOT", 12) == 0) {
-      if (!parse_flag(line, &compoundroot, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by compound_check() method */
-    if (line.compare(0, 18, "COMPOUNDPERMITFLAG", 18) == 0) {
-      if (!parse_flag(line, &compoundpermitflag, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by compound_check() method */
-    if (line.compare(0, 18, "COMPOUNDFORBIDFLAG", 18) == 0) {
-      if (!parse_flag(line, &compoundforbidflag, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    if (line.compare(0, 20, "COMPOUNDMORESUFFIXES", 20) == 0) {
-      compoundmoresuffixes = 1;
-    }
-
-    if (line.compare(0, 16, "CHECKCOMPOUNDDUP", 16) == 0) {
-      checkcompounddup = 1;
-    }
-
-    if (line.compare(0, 16, "CHECKCOMPOUNDREP", 16) == 0) {
-      checkcompoundrep = 1;
-    }
-
-    if (line.compare(0, 19, "CHECKCOMPOUNDTRIPLE", 19) == 0) {
-      checkcompoundtriple = 1;
-    }
-
-    if (line.compare(0, 16, "SIMPLIFIEDTRIPLE", 16) == 0) {
-      simplifiedtriple = 1;
-    }
-
-    if (line.compare(0, 17, "CHECKCOMPOUNDCASE", 17) == 0) {
-      checkcompoundcase = 1;
-    }
-
-    if (line.compare(0, 9, "NOSUGGEST", 9) == 0) {
-      if (!parse_flag(line, &nosuggest, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    if (line.compare(0, 14, "NONGRAMSUGGEST", 14) == 0) {
-      if (!parse_flag(line, &nongramsuggest, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by forbidden words */
-    if (line.compare(0, 13, "FORBIDDENWORD", 13) == 0) {
-      if (!parse_flag(line, &forbiddenword, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by forbidden words (is deprecated) */
-    if (line.compare(0, 13, "LEMMA_PRESENT", 13) == 0) {
-      if (!parse_flag(line, &lemma_present, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by circumfixes */
-    if (line.compare(0, 9, "CIRCUMFIX", 9) == 0) {
-      if (!parse_flag(line, &circumfix, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by fogemorphemes */
-    if (line.compare(0, 14, "ONLYINCOMPOUND", 14) == 0) {
-      if (!parse_flag(line, &onlyincompound, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by `needaffixs' (is deprecated) */
-    if (line.compare(0, 10, "PSEUDOROOT", 10) == 0) {
-      if (!parse_flag(line, &needaffix, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by `needaffixs' */
-    if (line.compare(0, 9, "NEEDAFFIX", 9) == 0) {
-      if (!parse_flag(line, &needaffix, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the minimal length for words in compounds */
-    if (line.compare(0, 11, "COMPOUNDMIN", 11) == 0) {
-      if (!parse_num(line, &cpdmin, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-      if (cpdmin < 1)
-        cpdmin = 1;
-    }
-
-    /* parse in the max. words and syllables in compounds */
-    if (line.compare(0, 16, "COMPOUNDSYLLABLE", 16) == 0) {
-      if (!parse_cpdsyllable(line, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by compound_check() method */
-    if (line.compare(0, 11, "SYLLABLENUM", 11) == 0) {
-      if (!parse_string(line, cpdsyllablenum, afflst->getlinenum())) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by the controlled compound words */
-    if (line.compare(0, 8, "CHECKNUM", 8) == 0) {
-      checknum = 1;
-    }
-
-    /* parse in the extra word characters */
-    if (line.compare(0, 9, "WORDCHARS", 9) == 0) {
-      if (!parse_array(line, wordchars, wordchars_utf16,
-                       utf8, afflst->getlinenum())) {
-        finishFileMgr(afflst);
-        return 1;
-      }
+    /* parse in the language for language specific codes */
+    else if (is_string_start_with(line, "LANG")) {
+      is_good_parse = parse_string(line, lang, afflst.getlinenum());
+      if(is_good_parse)
+        langnum = get_lang_num(lang);
     }
 
     /* parse in the ignored characters (for example, Arabic optional diacretics
      * charachters */
-    if (line.compare(0, 6, "IGNORE", 6) == 0) {
-      if (!parse_array(line, ignorechars, ignorechars_utf16,
-                       utf8, afflst->getlinenum())) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
+    else if (is_string_start_with(line, "IGNORE"))
+      is_good_parse = parse_array(line, ignorechars, ignorechars_utf16,
+                       utf8, afflst.getlinenum());
 
-    /* parse in the input conversion table */
-    if (line.compare(0, 5, "ICONV", 5) == 0) {
-      if (!parse_convtable(line, afflst, &iconvtable, "ICONV")) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
+    else if (is_string_start_with(line, "AF"))
+      is_good_parse = parse_aliasf(line, afflst);
 
-    /* parse in the output conversion table */
-    if (line.compare(0, 5, "OCONV", 5) == 0) {
-      if (!parse_convtable(line, afflst, &oconvtable, "OCONV")) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
+    else if (is_string_start_with(line, "AM"))
+      is_good_parse = parse_aliasm(line, afflst);
 
-    /* parse in the phonetic translation table */
-    if (line.compare(0, 5, "PHONE", 5) == 0) {
-      if (!parse_phonetable(line, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
+    /* parse in the keyboard string */
+    else if (is_string_start_with(line, "KEY"))
+      is_good_parse = parse_string(line, keystring, afflst.getlinenum());
 
-    /* parse in the checkcompoundpattern table */
-    if (line.compare(0, 20, "CHECKCOMPOUNDPATTERN", 20) == 0) {
-      if (!parse_checkcpdtable(line, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
+    /* parse in the try string */
+    else if (is_string_start_with(line, "TRY"))
+      is_good_parse = parse_string(line, trystring, afflst.getlinenum());
 
-    /* parse in the defcompound table */
-    if (line.compare(0, 12, "COMPOUNDRULE", 12) == 0) {
-      if (!parse_defcpdtable(line, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
+    else if (is_string_start_with(line, "NOSUGGEST"))
+      is_good_parse = parse_flag(line, &nosuggest, afflst);
+
+    else if (is_string_start_with(line, "MAXCPDSUGS"))
+      is_good_parse = parse_num(line, &maxcpdsugs, afflst);
+
+    else if (is_string_start_with(line, "MAXNGRAMSUGS"))
+      is_good_parse = parse_num(line, &maxngramsugs, afflst);
+
+    else if (is_string_start_with(line, "MAXDIFF"))
+      is_good_parse = parse_num(line, &maxdiff, afflst);
+
+    else if (is_string_start_with(line, "ONLYMAXDIFF"))
+      onlymaxdiff = true;
+
+    else if (is_string_start_with(line, "NOSPLITSUGS"))
+      nosplitsugs = true;
+
+    else if (is_string_start_with(line, "SUGSWITHDOTS"))
+      sugswithdots = true;
+
+    else if (is_string_start_with(line, "REP"))
+      is_good_parse = parse_reptable(line, afflst);
 
     /* parse in the related character map table */
-    if (line.compare(0, 3, "MAP", 3) == 0) {
-      if (!parse_maptable(line, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
+    else if (is_string_start_with(line, "MAP"))
+      is_good_parse = parse_maptable(line, afflst);
 
-    /* parse in the word breakpoints table */
-    if (line.compare(0, 5, "BREAK", 5) == 0) {
-      if (!parse_breaktable(line, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the language for language specific codes */
-    if (line.compare(0, 4, "LANG", 4) == 0) {
-      if (!parse_string(line, lang, afflst->getlinenum())) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-      langnum = get_lang_num(lang);
-    }
-
-    if (line.compare(0, 7, "VERSION", 7) == 0) {
-      size_t startpos = line.find_first_not_of(" \t", 7);
-      if (startpos != std::string::npos) {
-          version = line.substr(startpos);
-      }
-    }
-
-    if (line.compare(0, 12, "MAXNGRAMSUGS", 12) == 0) {
-      if (!parse_num(line, &maxngramsugs, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    if (line.compare(0, 11, "ONLYMAXDIFF", 11) == 0)
-      onlymaxdiff = 1;
-
-    if (line.compare(0, 7, "MAXDIFF", 7) == 0) {
-      if (!parse_num(line, &maxdiff, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    if (line.compare(0, 10, "MAXCPDSUGS", 10) == 0) {
-      if (!parse_num(line, &maxcpdsugs, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    if (line.compare(0, 11, "NOSPLITSUGS", 11) == 0) {
-      nosplitsugs = 1;
-    }
-
-    if (line.compare(0, 9, "FULLSTRIP", 9) == 0) {
-      fullstrip = 1;
-    }
-
-    if (line.compare(0, 12, "SUGSWITHDOTS", 12) == 0) {
-      sugswithdots = 1;
-    }
-
-    /* parse in the flag used by forbidden words */
-    if (line.compare(0, 8, "KEEPCASE", 8) == 0) {
-      if (!parse_flag(line, &keepcase, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
-
-    /* parse in the flag used by `forceucase' */
-    if (line.compare(0, 10, "FORCEUCASE", 10) == 0) {
-      if (!parse_flag(line, &forceucase, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
+    /* parse in the phonetic translation table */
+    else if (is_string_start_with(line, "PHONE"))
+      is_good_parse = parse_phonetable(line, afflst);
 
     /* parse in the flag used by `warn' */
-    if (line.compare(0, 4, "WARN", 4) == 0) {
-      if (!parse_flag(line, &warn, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
+    else if (is_string_start_with(line, "WARN"))
+      is_good_parse = parse_flag(line, &warn, afflst);
+
+    else if (is_string_start_with(line, "FORBIDWARN"))
+      forbidwarn = true;
+
+    /* parse in the word breakpoints table */
+    else if (is_string_start_with(line, "BREAK"))
+      is_good_parse = parse_breaktable(line, afflst);
+
+    /* parse in the defcompound table */
+    else if (is_string_start_with(line, "COMPOUNDRULE"))
+      is_good_parse = parse_defcpdtable(line, afflst);
+
+    /* parse in the minimal length for words in compounds */
+    else if (is_string_start_with(line, "COMPOUNDMIN")) {
+      is_good_parse = parse_num(line, &cpdmin, afflst);
+      if (is_good_parse && cpdmin < 1)
+        cpdmin = 1;
     }
 
-    if (line.compare(0, 10, "FORBIDWARN", 10) == 0) {
-      forbidwarn = 1;
+    /* parse in the flag used by the controlled compound words */
+    else if (is_string_start_with(line, "COMPOUNDFLAG"))
+      is_good_parse = parse_flag(line, &compoundflag, afflst);
+
+    /* parse in the flag used by compound words */
+    else if (is_string_start_with(line, "COMPOUNDBEGIN")) {
+      is_good_parse = complexprefixes
+        ? parse_flag(line, &compoundend, afflst)
+        : parse_flag(line, &compoundbegin, afflst);
     }
 
+    /* parse in the flag used by compound words */
+    else if (is_string_start_with(line, "COMPOUNDMIDDLE"))
+      is_good_parse = parse_flag(line, &compoundmiddle, afflst);
+
+    /* parse in the flag used by compound words */
+    else if (is_string_start_with(line, "COMPOUNDEND")) {
+      is_good_parse = complexprefixes
+        ? parse_flag(line, &compoundbegin, afflst)
+        : parse_flag(line, &compoundend, afflst);
+    }
+
+    /* parse in the flag used by fogemorphemes */
+    else if (is_string_start_with(line, "ONLYINCOMPOUND"))
+      is_good_parse = parse_flag(line, &onlyincompound, afflst);
+
+    /* parse in the flag used by compound_check() method */
+    else if (is_string_start_with(line, "COMPOUNDPERMITFLAG"))
+      is_good_parse = parse_flag(line, &compoundpermitflag, afflst);
+
+    /* parse in the flag used by compound_check() method */
+    else if (is_string_start_with(line, "COMPOUNDFORBIDFLAG"))
+      is_good_parse = parse_flag(line, &compoundforbidflag, afflst);
+
+    /* parse in the flag sign compounds in dictionary */
+    else if (is_string_start_with(line, "COMPOUNDROOT"))
+      is_good_parse = parse_flag(line, &compoundroot, afflst);
+
+    /* parse in the data used by compound_check() method */
+    else if (is_string_start_with(line, "COMPOUNDWORDMAX"))
+      is_good_parse = parse_num(line, &cpdwordmax, afflst);
+
+    else if (is_string_start_with(line, "CHECKCOMPOUNDDUP"))
+      checkcompounddup = true;
+
+    else if (is_string_start_with(line, "CHECKCOMPOUNDREP"))
+      checkcompoundrep = true;
+
+    else if (is_string_start_with(line, "CHECKCOMPOUNDCASE"))
+      checkcompoundcase = true;
+
+    else if (is_string_start_with(line, "CHECKCOMPOUNDTRIPLE"))
+      checkcompoundtriple = true;
+
+    else if (is_string_start_with(line, "SIMPLIFIEDTRIPLE"))
+      simplifiedtriple = true;
+
+    /* parse in the checkcompoundpattern table */
+    else if (is_string_start_with(line, "CHECKCOMPOUNDPATTERN"))
+      is_good_parse = parse_checkcpdtable(line, afflst);
+
+    /* parse in the flag used by `forceucase' */
+    else if (is_string_start_with(line, "FORCEUCASE"))
+      is_good_parse = parse_flag(line, &forceucase, afflst);
+
+    /* parse in the max. words and syllables in compounds */
+    else if (is_string_start_with(line, "COMPOUNDSYLLABLE"))
+      is_good_parse = parse_cpdsyllable(line, afflst);
+
+    /* parse in the flag used by compound_check() method */
+    else if (is_string_start_with(line, "SYLLABLENUM"))
+      is_good_parse = parse_string(line, cpdsyllablenum, afflst.getlinenum());
+
+    /* parse in the flag used by circumfixes */
+    else if (is_string_start_with(line, "CIRCUMFIX"))
+      is_good_parse = parse_flag(line, &circumfix, afflst);
+
+    /* parse in the flag used by forbidden words */
+    else if (is_string_start_with(line, "FORBIDDENWORD"))
+      is_good_parse = parse_flag(line, &forbiddenword, afflst);
+
+    else if (is_string_start_with(line, "FULLSTRIP"))
+      fullstrip = true;
+
+    /* parse in the flag used by forbidden words */
+    else if (is_string_start_with(line, "KEEPCASE"))
+      is_good_parse = parse_flag(line, &keepcase, afflst);
+
+    /* parse in the input conversion table */
+    else if (is_string_start_with(line, "ICONV"))
+      is_good_parse = parse_convtable(line, afflst, &iconvtable, "ICONV");
+
+    /* parse in the output conversion table */
+    else if (is_string_start_with(line, "OCONV"))
+      is_good_parse = parse_convtable(line, afflst, &oconvtable, "OCONV");
+    
+    /* parse in the flag used by forbidden words (is deprecated) */
+    else if (is_string_start_with(line, "LEMMA_PRESENT"))
+      is_good_parse = parse_flag(line, &lemma_present, afflst);
+
+    /* parse in the flag used by `needaffixs' */
+    else if (is_string_start_with(line, "NEEDAFFIX"))
+      is_good_parse = parse_flag(line, &needaffix, afflst);
+    
+    /* parse in the flag used by `needaffixs' (is deprecated) */
+    else if (is_string_start_with(line, "PSEUDOROOT"))
+      is_good_parse = parse_flag(line, &needaffix, afflst);
+    
     /* parse in the flag used by the affix generator */
-    if (line.compare(0, 11, "SUBSTANDARD", 11) == 0) {
-      if (!parse_flag(line, &substandard, afflst)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
-    }
+    else if (is_string_start_with(line, "SUBSTANDARD"))
+      is_good_parse = parse_flag(line, &substandard, afflst);
 
-    if (line.compare(0, 11, "CHECKSHARPS", 11) == 0) {
-      checksharps = 1;
+    /* parse in the extra word characters */
+    else if (is_string_start_with(line, "WORDCHARS"))
+      is_good_parse = parse_array(line, wordchars, wordchars_utf16,
+                       utf8, afflst.getlinenum());
+
+    else if (is_string_start_with(line, "CHECKSHARPS"))
+      checksharps = true;
+    
+    else if (is_string_start_with(line, "COMPOUNDMORESUFFIXES"))
+      compoundmoresuffixes = false;
+
+    else if (is_string_start_with(line, "NONGRAMSUGGEST"))
+      is_good_parse = parse_flag(line, &nongramsuggest, afflst);
+
+    /* parse in the flag used by the controlled compound words */
+    else if (is_string_start_with(line, "CHECKNUM"))
+      checknum = true;
+
+    else if (is_string_start_with(line, "VERSION")) {
+      size_t startpos = line.find_first_not_of(" \t", 7);
+      if (startpos != std::string::npos)
+        version = line.substr(startpos);
     }
 
     /* parse this affix: P - prefix, S - suffix */
     // affix type
-    char ft = ' ';
-    if (line.compare(0, 3, "PFX", 3) == 0)
-      ft = complexprefixes ? 'S' : 'P';
-    if (line.compare(0, 3, "SFX", 3) == 0)
-      ft = complexprefixes ? 'P' : 'S';
-    if (ft != ' ') {
-      if (dupflags_ini) {
-        memset(dupflags, 0, sizeof(dupflags));
-        dupflags_ini = 0;
-      }
-      if (!parse_affix(line, ft, afflst, dupflags)) {
-        finishFileMgr(afflst);
-        return 1;
-      }
+    else if (is_string_start_with(line, "PFX")) {
+      char ft = complexprefixes ? 'S' : 'P';
+      is_good_parse = parse_affix(line, ft, afflst, dupflags);
+    }
+
+    else if (is_string_start_with(line, "SFX")) {
+      char ft = complexprefixes ? 'P' : 'S';
+      is_good_parse = parse_affix(line, ft, afflst, dupflags);
     }
   }
 
-  finishFileMgr(afflst);
+  if (csconv == NULL)
+    csconv = get_current_cs(SPELL_ENCODING);
+
+  // convert affix trees to sorted list
+  process_pfx_tree_to_list();
+  process_sfx_tree_to_list();
+
+  // Parse error
+  if(!is_good_parse)
+    return 1;
+
   // affix trees are sorted now
 
   // now we can speed up performance greatly taking advantage of the
@@ -3305,7 +3194,7 @@ std::string AffixMgr::morphgen(const char* ts,
         if (cmp == 0) {
           std::string newword = sptr->add(ts, wl);
           if (!newword.empty()) {
-            hentry* check = pHMgr->lookup(newword.c_str());  // XXX extra dic
+            hentry* check = lookup(newword.c_str());  // XXX extra dic
             if (!check || !check->astr ||
                 !(TESTAFF(check->astr, forbiddenword, check->alen) ||
                   TESTAFF(check->astr, ONLYUPCASEFLAG, check->alen))) {
@@ -3478,8 +3367,8 @@ int AffixMgr::expand_rootword(struct guessword* wlst,
 }
 
 // return replacing table
-const std::vector<replentry>& AffixMgr::get_reptable() const {
-  return pHMgr->get_reptable();
+std::vector<replentry>& AffixMgr::get_reptable() {
+  return reptable;
 }
 
 // return iconv table
@@ -3553,10 +3442,6 @@ int AffixMgr::get_forbidwarn() const {
 
 int AffixMgr::get_checksharps() const {
   return checksharps;
-}
-
-char* AffixMgr::encode_flag(unsigned short aflag) const {
-  return pHMgr->encode_flag(aflag);
 }
 
 // return the preferred ignore string for suggestions
@@ -3685,39 +3570,39 @@ int AffixMgr::get_sugswithdots(void) const {
 }
 
 /* parse flag */
-bool AffixMgr::parse_flag(const std::string& line, unsigned short* out, FileMgr* af) {
+bool AffixMgr::parse_flag(const std::string& line, unsigned short* out, DataMgr& af) {
   if (*out != FLAG_NULL && !(*out >= DEFAULTFLAGS)) {
     HUNSPELL_WARNING(
         stderr,
         "error: line %d: multiple definitions of an affix file parameter\n",
-        af->getlinenum());
+        af.getlinenum());
     return false;
   }
   std::string s;
-  if (!parse_string(line, s, af->getlinenum()))
+  if (!parse_string(line, s, af.getlinenum()))
     return false;
-  *out = pHMgr->decode_flag(s.c_str());
+  *out = decode_flag(s.c_str());
   return true;
 }
 
 /* parse num */
-bool AffixMgr::parse_num(const std::string& line, int* out, FileMgr* af) {
+bool AffixMgr::parse_num(const std::string& line, int* out, DataMgr& af) {
   if (*out != -1) {
     HUNSPELL_WARNING(
         stderr,
         "error: line %d: multiple definitions of an affix file parameter\n",
-        af->getlinenum());
+        af.getlinenum());
     return false;
   }
   std::string s;
-  if (!parse_string(line, s, af->getlinenum()))
+  if (!parse_string(line, s, af.getlinenum()))
     return false;
   *out = atoi(s.c_str());
   return true;
 }
 
 /* parse in the max syllablecount of compound words and  */
-bool AffixMgr::parse_cpdsyllable(const std::string& line, FileMgr* af) {
+bool AffixMgr::parse_cpdsyllable(const std::string& line, DataMgr& af) {
   int i = 0;
   int np = 0;
   std::string::const_iterator iter = line.begin();
@@ -3754,7 +3639,7 @@ bool AffixMgr::parse_cpdsyllable(const std::string& line, FileMgr* af) {
   if (np < 2) {
     HUNSPELL_WARNING(stderr,
                      "error: line %d: missing compoundsyllable information\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
   if (np == 2)
@@ -3763,12 +3648,12 @@ bool AffixMgr::parse_cpdsyllable(const std::string& line, FileMgr* af) {
 }
 
 bool AffixMgr::parse_convtable(const std::string& line,
-                              FileMgr* af,
+                              DataMgr& af,
                               RepList** rl,
                               const std::string& keyword) {
   if (*rl) {
     HUNSPELL_WARNING(stderr, "error: line %d: multiple table definitions\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
   int i = 0;
@@ -3786,7 +3671,7 @@ bool AffixMgr::parse_convtable(const std::string& line,
         numrl = atoi(std::string(start_piece, iter).c_str());
         if (numrl < 1) {
           HUNSPELL_WARNING(stderr, "error: line %d: incorrect entry number\n",
-                           af->getlinenum());
+                           af.getlinenum());
           return false;
         }
         *rl = new RepList(numrl);
@@ -3803,14 +3688,14 @@ bool AffixMgr::parse_convtable(const std::string& line,
   }
   if (np != 2) {
     HUNSPELL_WARNING(stderr, "error: line %d: missing data\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
 
   /* now parse the num lines to read in the remainder of the table */
   for (int j = 0; j < numrl; j++) {
     std::string nl;
-    if (!af->getline(nl))
+    if (!af.getline(nl))
       return false;
     mychomp(nl);
     i = 0;
@@ -3824,7 +3709,7 @@ bool AffixMgr::parse_convtable(const std::string& line,
           case 0: {
             if (nl.compare(start_piece - nl.begin(), keyword.size(), keyword, 0, keyword.size()) != 0) {
               HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
-                               af->getlinenum());
+                               af.getlinenum());
               delete *rl;
               *rl = NULL;
               return false;
@@ -3848,7 +3733,7 @@ bool AffixMgr::parse_convtable(const std::string& line,
     }
     if (pattern.empty() || pattern2.empty()) {
       HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
-                       af->getlinenum());
+                       af.getlinenum());
       return false;
     }
     (*rl)->add(pattern, pattern2);
@@ -3857,10 +3742,10 @@ bool AffixMgr::parse_convtable(const std::string& line,
 }
 
 /* parse in the typical fault correcting table */
-bool AffixMgr::parse_phonetable(const std::string& line, FileMgr* af) {
+bool AffixMgr::parse_phonetable(const std::string& line, DataMgr& af) {
   if (phone) {
     HUNSPELL_WARNING(stderr, "error: line %d: multiple table definitions\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
   int num = -1;
@@ -3878,7 +3763,7 @@ bool AffixMgr::parse_phonetable(const std::string& line, FileMgr* af) {
         num = atoi(std::string(start_piece, iter).c_str());
         if (num < 1) {
           HUNSPELL_WARNING(stderr, "error: line %d: bad entry number\n",
-                           af->getlinenum());
+                           af.getlinenum());
           return false;
         }
         phone = new phonetable;
@@ -3894,14 +3779,14 @@ bool AffixMgr::parse_phonetable(const std::string& line, FileMgr* af) {
   }
   if (np != 2) {
     HUNSPELL_WARNING(stderr, "error: line %d: missing data\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
 
   /* now parse the phone->num lines to read in the remainder of the table */
   for (int j = 0; j < num; ++j) {
     std::string nl;
-    if (!af->getline(nl))
+    if (!af.getline(nl))
       return false;
     mychomp(nl);
     i = 0;
@@ -3914,7 +3799,7 @@ bool AffixMgr::parse_phonetable(const std::string& line, FileMgr* af) {
           case 0: {
             if (nl.compare(start_piece - nl.begin(), 5, "PHONE", 5) != 0) {
               HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
-                               af->getlinenum());
+                               af.getlinenum());
               return false;
             }
             break;
@@ -3937,7 +3822,7 @@ bool AffixMgr::parse_phonetable(const std::string& line, FileMgr* af) {
     }
     if (phone->rules.size() != old_size + 2) {
       HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
-                       af->getlinenum());
+                       af.getlinenum());
       phone->rules.clear();
       return false;
     }
@@ -3949,10 +3834,10 @@ bool AffixMgr::parse_phonetable(const std::string& line, FileMgr* af) {
 }
 
 /* parse in the checkcompoundpattern table */
-bool AffixMgr::parse_checkcpdtable(const std::string& line, FileMgr* af) {
+bool AffixMgr::parse_checkcpdtable(const std::string& line, DataMgr& af) {
   if (parsedcheckcpd) {
     HUNSPELL_WARNING(stderr, "error: line %d: multiple table definitions\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
   parsedcheckcpd = true;
@@ -3971,7 +3856,7 @@ bool AffixMgr::parse_checkcpdtable(const std::string& line, FileMgr* af) {
         numcheckcpd = atoi(std::string(start_piece, iter).c_str());
         if (numcheckcpd < 1) {
           HUNSPELL_WARNING(stderr, "error: line %d: bad entry number\n",
-                           af->getlinenum());
+                           af.getlinenum());
           return false;
         }
         checkcpdtable.reserve(numcheckcpd);
@@ -3986,14 +3871,14 @@ bool AffixMgr::parse_checkcpdtable(const std::string& line, FileMgr* af) {
   }
   if (np != 2) {
     HUNSPELL_WARNING(stderr, "error: line %d: missing data\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
 
   /* now parse the numcheckcpd lines to read in the remainder of the table */
   for (int j = 0; j < numcheckcpd; ++j) {
     std::string nl;
-    if (!af->getline(nl))
+    if (!af.getline(nl))
       return false;
     mychomp(nl);
     i = 0;
@@ -4005,7 +3890,7 @@ bool AffixMgr::parse_checkcpdtable(const std::string& line, FileMgr* af) {
         case 0: {
           if (nl.compare(start_piece - nl.begin(), 20, "CHECKCOMPOUNDPATTERN", 20) != 0) {
             HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
-                             af->getlinenum());
+                             af.getlinenum());
             return false;
           }
           break;
@@ -4016,7 +3901,7 @@ bool AffixMgr::parse_checkcpdtable(const std::string& line, FileMgr* af) {
           if (slash_pos != std::string::npos) {
             std::string chunk(checkcpdtable.back().pattern, slash_pos + 1);
             checkcpdtable.back().pattern.resize(slash_pos);
-            checkcpdtable.back().cond = pHMgr->decode_flag(chunk.c_str());
+            checkcpdtable.back().cond = decode_flag(chunk.c_str());
           }
           break;
         }
@@ -4026,7 +3911,7 @@ bool AffixMgr::parse_checkcpdtable(const std::string& line, FileMgr* af) {
           if (slash_pos != std::string::npos) {
             std::string chunk(checkcpdtable.back().pattern2, slash_pos + 1);
             checkcpdtable.back().pattern2.resize(slash_pos);
-            checkcpdtable.back().cond2 = pHMgr->decode_flag(chunk.c_str());
+            checkcpdtable.back().cond2 = decode_flag(chunk.c_str());
           }
           break;
         }
@@ -4046,10 +3931,10 @@ bool AffixMgr::parse_checkcpdtable(const std::string& line, FileMgr* af) {
 }
 
 /* parse in the compound rule table */
-bool AffixMgr::parse_defcpdtable(const std::string& line, FileMgr* af) {
+bool AffixMgr::parse_defcpdtable(const std::string& line, DataMgr& af) {
   if (parseddefcpd) {
     HUNSPELL_WARNING(stderr, "error: line %d: multiple table definitions\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
   parseddefcpd = true;
@@ -4068,7 +3953,7 @@ bool AffixMgr::parse_defcpdtable(const std::string& line, FileMgr* af) {
         numdefcpd = atoi(std::string(start_piece, iter).c_str());
         if (numdefcpd < 1) {
           HUNSPELL_WARNING(stderr, "error: line %d: bad entry number\n",
-                           af->getlinenum());
+                           af.getlinenum());
           return false;
         }
         defcpdtable.reserve(numdefcpd);
@@ -4083,14 +3968,14 @@ bool AffixMgr::parse_defcpdtable(const std::string& line, FileMgr* af) {
   }
   if (np != 2) {
     HUNSPELL_WARNING(stderr, "error: line %d: missing data\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
 
   /* now parse the numdefcpd lines to read in the remainder of the table */
   for (int j = 0; j < numdefcpd; ++j) {
     std::string nl;
-    if (!af->getline(nl))
+    if (!af.getline(nl))
       return false;
     mychomp(nl);
     i = 0;
@@ -4102,7 +3987,7 @@ bool AffixMgr::parse_defcpdtable(const std::string& line, FileMgr* af) {
         case 0: {
           if (nl.compare(start_piece - nl.begin(), 12, "COMPOUNDRULE", 12) != 0) {
             HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
-                             af->getlinenum());
+                             af.getlinenum());
             numdefcpd = 0;
             return false;
           }
@@ -4125,11 +4010,11 @@ bool AffixMgr::parse_defcpdtable(const std::string& line, FileMgr* af) {
               if (*chb == '*' || *chb == '?') {
                 defcpdtable.back().push_back((FLAG)*chb);
               } else {
-                pHMgr->decode_flags(defcpdtable.back(), std::string(chb, che), af);
+                decode_flags(defcpdtable.back(), std::string(chb, che), af);
               }
             }
           } else {
-            pHMgr->decode_flags(defcpdtable.back(), std::string(start_piece, iter), af);
+            decode_flags(defcpdtable.back(), std::string(start_piece, iter), af);
           }
           break;
         }
@@ -4141,7 +4026,7 @@ bool AffixMgr::parse_defcpdtable(const std::string& line, FileMgr* af) {
     }
     if (defcpdtable.back().empty()) {
       HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
-                       af->getlinenum());
+                       af.getlinenum());
       return false;
     }
   }
@@ -4149,10 +4034,10 @@ bool AffixMgr::parse_defcpdtable(const std::string& line, FileMgr* af) {
 }
 
 /* parse in the character map table */
-bool AffixMgr::parse_maptable(const std::string& line, FileMgr* af) {
+bool AffixMgr::parse_maptable(const std::string& line, DataMgr& af) {
   if (parsedmaptable) {
     HUNSPELL_WARNING(stderr, "error: line %d: multiple table definitions\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
   parsedmaptable = true;
@@ -4171,7 +4056,7 @@ bool AffixMgr::parse_maptable(const std::string& line, FileMgr* af) {
         nummap = atoi(std::string(start_piece, iter).c_str());
         if (nummap < 1) {
           HUNSPELL_WARNING(stderr, "error: line %d: bad entry number\n",
-                           af->getlinenum());
+                           af.getlinenum());
           return false;
         }
         maptable.reserve(nummap);
@@ -4186,14 +4071,14 @@ bool AffixMgr::parse_maptable(const std::string& line, FileMgr* af) {
   }
   if (np != 2) {
     HUNSPELL_WARNING(stderr, "error: line %d: missing data\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
 
   /* now parse the nummap lines to read in the remainder of the table */
   for (int j = 0; j < nummap; ++j) {
     std::string nl;
-    if (!af->getline(nl))
+    if (!af.getline(nl))
       return false;
     mychomp(nl);
     i = 0;
@@ -4205,7 +4090,7 @@ bool AffixMgr::parse_maptable(const std::string& line, FileMgr* af) {
         case 0: {
           if (nl.compare(start_piece - nl.begin(), 3, "MAP", 3) != 0) {
             HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
-                             af->getlinenum());
+                             af.getlinenum());
             nummap = 0;
             return false;
           }
@@ -4243,7 +4128,7 @@ bool AffixMgr::parse_maptable(const std::string& line, FileMgr* af) {
     }
     if (maptable.back().empty()) {
       HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
-                       af->getlinenum());
+                       af.getlinenum());
       return false;
     }
   }
@@ -4251,10 +4136,10 @@ bool AffixMgr::parse_maptable(const std::string& line, FileMgr* af) {
 }
 
 /* parse in the word breakpoint table */
-bool AffixMgr::parse_breaktable(const std::string& line, FileMgr* af) {
+bool AffixMgr::parse_breaktable(const std::string& line, DataMgr& af) {
   if (parsedbreaktable) {
     HUNSPELL_WARNING(stderr, "error: line %d: multiple table definitions\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
   parsedbreaktable = true;
@@ -4273,7 +4158,7 @@ bool AffixMgr::parse_breaktable(const std::string& line, FileMgr* af) {
         numbreak = atoi(std::string(start_piece, iter).c_str());
         if (numbreak < 0) {
           HUNSPELL_WARNING(stderr, "error: line %d: bad entry number\n",
-                           af->getlinenum());
+                           af.getlinenum());
           return false;
         }
         if (numbreak == 0)
@@ -4290,14 +4175,14 @@ bool AffixMgr::parse_breaktable(const std::string& line, FileMgr* af) {
   }
   if (np != 2) {
     HUNSPELL_WARNING(stderr, "error: line %d: missing data\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
 
   /* now parse the numbreak lines to read in the remainder of the table */
   for (int j = 0; j < numbreak; ++j) {
     std::string nl;
-    if (!af->getline(nl))
+    if (!af.getline(nl))
       return false;
     mychomp(nl);
     i = 0;
@@ -4308,7 +4193,7 @@ bool AffixMgr::parse_breaktable(const std::string& line, FileMgr* af) {
         case 0: {
           if (nl.compare(start_piece - nl.begin(), 5, "BREAK", 5) != 0) {
             HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
-                             af->getlinenum());
+                             af.getlinenum());
             numbreak = 0;
             return false;
           }
@@ -4328,7 +4213,7 @@ bool AffixMgr::parse_breaktable(const std::string& line, FileMgr* af) {
 
   if (breaktable.size() != static_cast<size_t>(numbreak)) {
     HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
-                     af->getlinenum());
+                     af.getlinenum());
     return false;
   }
 
@@ -4424,7 +4309,7 @@ public:
 
 bool AffixMgr::parse_affix(const std::string& line,
                           const char at,
-                          FileMgr* af,
+                          DataMgr& af,
                           char* dupflags) {
   int numents = 0;  // number of AffEntry structures to parse
 
@@ -4456,13 +4341,13 @@ bool AffixMgr::parse_affix(const std::string& line,
       // piece 2 - is affix char
       case 1: {
         np++;
-        aflag = pHMgr->decode_flag(std::string(start_piece, iter).c_str());
+        aflag = decode_flag(std::string(start_piece, iter).c_str());
         if (((at == 'S') && (dupflags[aflag] & dupSFX)) ||
             ((at == 'P') && (dupflags[aflag] & dupPFX))) {
           HUNSPELL_WARNING(
               stderr,
               "error: line %d: multiple definitions of an affix flag\n",
-              af->getlinenum());
+              af.getlinenum());
         }
         dupflags[aflag] += (char)((at == 'S') ? dupSFX : dupPFX);
         break;
@@ -4481,10 +4366,10 @@ bool AffixMgr::parse_affix(const std::string& line,
         numents = atoi(std::string(start_piece, iter).c_str());
         if ((numents <= 0) || ((std::numeric_limits<size_t>::max() /
                                 sizeof(AffEntry)) < static_cast<size_t>(numents))) {
-          char* err = pHMgr->encode_flag(aflag);
+          char* err = encode_flag(aflag);
           if (err) {
             HUNSPELL_WARNING(stderr, "error: line %d: bad entry number\n",
-                             af->getlinenum());
+                             af.getlinenum());
             free(err);
           }
           return false;
@@ -4493,9 +4378,9 @@ bool AffixMgr::parse_affix(const std::string& line,
         char opts = ff;
         if (utf8)
           opts += aeUTF8;
-        if (pHMgr->is_aliasf())
+        if (is_aliasf())
           opts += aeALIASF;
-        if (pHMgr->is_aliasm())
+        if (is_aliasm())
           opts += aeALIASM;
         affentries.initialize(numents, opts, aflag);
       }
@@ -4508,10 +4393,10 @@ bool AffixMgr::parse_affix(const std::string& line,
   }
   // check to make sure we parsed enough pieces
   if (np != 4) {
-    char* err = pHMgr->encode_flag(aflag);
+    char* err = encode_flag(aflag);
     if (err) {
       HUNSPELL_WARNING(stderr, "error: line %d: missing data\n",
-                       af->getlinenum());
+                       af.getlinenum());
       free(err);
     }
     return false;
@@ -4521,7 +4406,7 @@ bool AffixMgr::parse_affix(const std::string& line,
   AffEntry* entry = affentries.first_entry();
   for (int ent = 0; ent < numents; ++ent) {
     std::string nl;
-    if (!af->getline(nl))
+    if (!af.getline(nl))
       return false;
     mychomp(nl);
 
@@ -4545,12 +4430,12 @@ bool AffixMgr::parse_affix(const std::string& line,
         case 1: {
           np++;
           std::string chunk(start_piece, iter);
-          if (pHMgr->decode_flag(chunk.c_str()) != aflag) {
-            char* err = pHMgr->encode_flag(aflag);
+          if (decode_flag(chunk.c_str()) != aflag) {
+            char* err = encode_flag(aflag);
             if (err) {
               HUNSPELL_WARNING(stderr,
                                "error: line %d: affix %s is corrupt\n",
-                               af->getlinenum(), err);
+                               af.getlinenum(), err);
               free(err);
             }
             return false;
@@ -4605,16 +4490,16 @@ bool AffixMgr::parse_affix(const std::string& line,
                 reverseword(entry->appnd);
             }
 
-            if (pHMgr->is_aliasf()) {
+            if (is_aliasf()) {
               int index = atoi(dash_str.c_str());
-              entry->contclasslen = (unsigned short)pHMgr->get_aliasf(
+              entry->contclasslen = (unsigned short)get_aliasf(
                   index, &(entry->contclass), af);
               if (!entry->contclasslen)
                 HUNSPELL_WARNING(stderr,
                                  "error: bad affix flag alias: \"%s\"\n",
                                  dash_str.c_str());
             } else {
-              entry->contclasslen = (unsigned short)pHMgr->decode_flags(
+              entry->contclasslen = (unsigned short)decode_flags(
                   &(entry->contclass), dash_str.c_str(), af);
               std::sort(entry->contclass, entry->contclass + entry->contclasslen);
             }
@@ -4661,7 +4546,7 @@ bool AffixMgr::parse_affix(const std::string& line,
           }
           if (!entry->strip.empty() && chunk != "." &&
               redundant_condition(at, entry->strip.c_str(), entry->strip.size(), chunk.c_str(),
-                                  af->getlinenum()))
+                                  af.getlinenum()))
             chunk = ".";
           if (at == 'S') {
             reverseword(chunk);
@@ -4675,9 +4560,9 @@ bool AffixMgr::parse_affix(const std::string& line,
         case 5: {
           std::string chunk(start_piece, iter);
           np++;
-          if (pHMgr->is_aliasm()) {
+          if (is_aliasm()) {
             int index = atoi(chunk.c_str());
-            entry->morphcode = pHMgr->get_aliasm(index);
+            entry->morphcode = get_aliasm(index);
           } else {
             if (complexprefixes) {  // XXX - fix me for morph. gen.
               if (utf8)
@@ -4704,10 +4589,10 @@ bool AffixMgr::parse_affix(const std::string& line,
     }
     // check to make sure we parsed enough pieces
     if (np < 4) {
-      char* err = pHMgr->encode_flag(aflag);
+      char* err = encode_flag(aflag);
       if (err) {
         HUNSPELL_WARNING(stderr, "error: line %d: affix %s is corrupt\n",
-                         af->getlinenum(), err);
+                         af.getlinenum(), err);
         free(err);
       }
       return false;
@@ -4864,4 +4749,542 @@ std::vector<std::string> AffixMgr::get_suffix_words(short unsigned* suff,
     }
   }
   return slst;
+}
+
+int AffixMgr::get_aliasf(int index, unsigned short** fvec, DataMgr& af) const {
+  if ((index > 0) && (index <= numaliasf)) {
+    *fvec = aliasf[index - 1];
+    return aliasflen[index - 1];
+  }
+  HUNSPELL_WARNING(stderr, "error: line %d: bad flag alias index: %d\n",
+                   af.getlinenum(), index);
+  *fvec = NULL;
+  return 0;
+}
+
+/* parse in the ALIAS table */
+bool AffixMgr::parse_aliasf(const std::string& line, DataMgr& af) {
+  if (numaliasf != 0) {
+    HUNSPELL_WARNING(stderr, "error: line %d: multiple table definitions\n",
+                     af.getlinenum());
+    return false;
+  }
+  int i = 0;
+  int np = 0;
+  std::string::const_iterator iter = line.begin();
+  std::string::const_iterator start_piece = mystrsep(line, iter);
+  while (start_piece != line.end()) {
+    switch (i) {
+      case 0: {
+        np++;
+        break;
+      }
+      case 1: {
+        numaliasf = atoi(std::string(start_piece, iter).c_str());
+        if (numaliasf < 1) {
+          numaliasf = 0;
+          aliasf = NULL;
+          aliasflen = NULL;
+          HUNSPELL_WARNING(stderr, "error: line %d: bad entry number\n",
+                           af.getlinenum());
+          return false;
+        }
+        aliasf =
+            (unsigned short**)malloc(numaliasf * sizeof(unsigned short*));
+        aliasflen =
+            (unsigned short*)malloc(numaliasf * sizeof(unsigned short));
+        if (!aliasf || !aliasflen) {
+          numaliasf = 0;
+          if (aliasf)
+            free(aliasf);
+          if (aliasflen)
+            free(aliasflen);
+          aliasf = NULL;
+          aliasflen = NULL;
+          return false;
+        }
+        np++;
+        break;
+      }
+      default:
+        break;
+    }
+    ++i;
+    start_piece = mystrsep(line, iter);
+  }
+  if (np != 2) {
+    numaliasf = 0;
+    free(aliasf);
+    free(aliasflen);
+    aliasf = NULL;
+    aliasflen = NULL;
+    HUNSPELL_WARNING(stderr, "error: line %d: missing data\n",
+                     af.getlinenum());
+    return false;
+  }
+
+  /* now parse the numaliasf lines to read in the remainder of the table */
+  for (int j = 0; j < numaliasf; j++) {
+    std::string nl;
+    if (!af.getline(nl))
+      return false;
+    mychomp(nl);
+    i = 0;
+    aliasf[j] = NULL;
+    aliasflen[j] = 0;
+    iter = nl.begin();
+    start_piece = mystrsep(nl, iter);
+    while (start_piece != nl.end()) {
+      switch (i) {
+        case 0: {
+          if (nl.compare(start_piece - nl.begin(), 2, "AF", 2) != 0) {
+            numaliasf = 0;
+            free(aliasf);
+            free(aliasflen);
+            aliasf = NULL;
+            aliasflen = NULL;
+            HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
+                             af.getlinenum());
+            return false;
+          }
+          break;
+        }
+        case 1: {
+          std::string piece(start_piece, iter);
+          aliasflen[j] =
+              (unsigned short)decode_flags(&(aliasf[j]), piece, af);
+          std::sort(aliasf[j], aliasf[j] + aliasflen[j]);
+          break;
+        }
+        default:
+          break;
+      }
+      ++i;
+      start_piece = mystrsep(nl, iter);
+    }
+    if (!aliasf[j]) {
+      free(aliasf);
+      free(aliasflen);
+      aliasf = NULL;
+      aliasflen = NULL;
+      numaliasf = 0;
+      HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
+                       af.getlinenum());
+      return false;
+    }
+  }
+  return true;
+}
+
+/* parse morph alias definitions */
+bool AffixMgr::parse_aliasm(const std::string& line, DataMgr& af) {
+  if (numaliasm != 0) {
+    HUNSPELL_WARNING(stderr, "error: line %d: multiple table definitions\n",
+                     af.getlinenum());
+    return false;
+  }
+  int i = 0;
+  int np = 0;
+  std::string::const_iterator iter = line.begin();
+  std::string::const_iterator start_piece = mystrsep(line, iter);
+  while (start_piece != line.end()) {
+    switch (i) {
+      case 0: {
+        np++;
+        break;
+      }
+      case 1: {
+        numaliasm = atoi(std::string(start_piece, iter).c_str());
+        if (numaliasm < 1) {
+          HUNSPELL_WARNING(stderr, "error: line %d: bad entry number\n",
+                           af.getlinenum());
+          return false;
+        }
+        aliasm = (char**)malloc(numaliasm * sizeof(char*));
+        if (!aliasm) {
+          numaliasm = 0;
+          return false;
+        }
+        np++;
+        break;
+      }
+      default:
+        break;
+    }
+    ++i;
+    start_piece = mystrsep(line, iter);
+  }
+  if (np != 2) {
+    numaliasm = 0;
+    free(aliasm);
+    aliasm = NULL;
+    HUNSPELL_WARNING(stderr, "error: line %d: missing data\n",
+                     af.getlinenum());
+    return false;
+  }
+
+  /* now parse the numaliasm lines to read in the remainder of the table */
+  for (int j = 0; j < numaliasm; j++) {
+    std::string nl;
+    if (!af.getline(nl))
+      return false;
+    mychomp(nl);
+    aliasm[j] = NULL;
+    iter = nl.begin();
+    i = 0;
+    start_piece = mystrsep(nl, iter);
+    while (start_piece != nl.end()) {
+      switch (i) {
+        case 0: {
+          if (nl.compare(start_piece - nl.begin(), 2, "AM", 2) != 0) {
+            HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
+                             af.getlinenum());
+            numaliasm = 0;
+            free(aliasm);
+            aliasm = NULL;
+            return false;
+          }
+          break;
+        }
+        case 1: {
+          // add the remaining of the line
+          std::string::const_iterator end = nl.end();
+          std::string chunk(start_piece, end);
+          if (complexprefixes) {
+            if (utf8)
+              reverseword_utf(chunk);
+            else
+              reverseword(chunk);
+          }
+          aliasm[j] = mystrdup(chunk.c_str());
+          break;
+        }
+        default:
+          break;
+      }
+      ++i;
+      start_piece = mystrsep(nl, iter);
+    }
+    if (!aliasm[j]) {
+      numaliasm = 0;
+      free(aliasm);
+      aliasm = NULL;
+      HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
+                       af.getlinenum());
+      return false;
+    }
+  }
+  return true;
+}
+
+/* parse in the typical fault correcting table */
+bool AffixMgr::parse_reptable(const std::string& line, DataMgr& af) {
+  if (!reptable.empty()) {
+    HUNSPELL_WARNING(stderr, "error: line %d: multiple table definitions\n",
+                     af.getlinenum());
+    return false;
+  }
+  int numrep = -1;
+  int i = 0;
+  int np = 0;
+  std::string::const_iterator iter = line.begin();
+  std::string::const_iterator start_piece = mystrsep(line, iter);
+  while (start_piece != line.end()) {
+    switch (i) {
+      case 0: {
+        np++;
+        break;
+      }
+      case 1: {
+        numrep = atoi(std::string(start_piece, iter).c_str());
+        if (numrep < 1) {
+          HUNSPELL_WARNING(stderr, "error: line %d: incorrect entry number\n",
+                           af.getlinenum());
+          return false;
+        }
+        reptable.reserve(numrep);
+        np++;
+        break;
+      }
+      default:
+        break;
+    }
+    ++i;
+    start_piece = mystrsep(line, iter);
+  }
+  if (np != 2) {
+    HUNSPELL_WARNING(stderr, "error: line %d: missing data\n",
+                     af.getlinenum());
+    return false;
+  }
+
+  /* now parse the numrep lines to read in the remainder of the table */
+  for (int j = 0; j < numrep; ++j) {
+    std::string nl;
+    if (!af.getline(nl))
+      return false;
+    mychomp(nl);
+    reptable.push_back(replentry());
+    iter = nl.begin();
+    i = 0;
+    int type = 0;
+    start_piece = mystrsep(nl, iter);
+    while (start_piece != nl.end()) {
+      switch (i) {
+        case 0: {
+          if (nl.compare(start_piece - nl.begin(), 3, "REP", 3) != 0) {
+            HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
+                             af.getlinenum());
+            reptable.clear();
+            return false;
+          }
+          break;
+        }
+        case 1: {
+          if (*start_piece == '^')
+            type = 1;
+          reptable.back().pattern.assign(start_piece + type, iter);
+          mystrrep(reptable.back().pattern, "_", " ");
+          if (!reptable.back().pattern.empty() && reptable.back().pattern[reptable.back().pattern.size() - 1] == '$') {
+            type += 2;
+            reptable.back().pattern.resize(reptable.back().pattern.size() - 1);
+          }
+          break;
+        }
+        case 2: {
+          reptable.back().outstrings[type].assign(start_piece, iter);
+          mystrrep(reptable.back().outstrings[type], "_", " ");
+          break;
+        }
+        default:
+          break;
+      }
+      ++i;
+      start_piece = mystrsep(nl, iter);
+    }
+    if (reptable.back().pattern.empty() || reptable.back().outstrings[type].empty()) {
+      HUNSPELL_WARNING(stderr, "error: line %d: table is corrupt\n",
+                       af.getlinenum());
+      reptable.clear();
+      return false;
+    }
+  }
+  return true;
+}
+
+int AffixMgr::decode_flags(unsigned short** result, const std::string& flags, DataMgr& af) const {
+  int len;
+  if (flags.empty()) {
+    *result = NULL;
+    return 0;
+  }
+  switch (aff_flag_mode) {
+    case aff_flag_type::LONG: {  // two-character flags (1x2yZz -> 1x 2y Zz)
+      len = flags.size();
+      if (len % 2 == 1)
+        HUNSPELL_WARNING(stderr, "error: line %d: bad flagvector\n",
+                         af.getlinenum());
+      len /= 2;
+      *result = (unsigned short*)malloc(len * sizeof(unsigned short));
+      if (!*result)
+        return -1;
+      for (int i = 0; i < len; i++) {
+        (*result)[i] = ((unsigned short)((unsigned char)flags[i * 2]) << 8) +
+                       (unsigned char)flags[i * 2 + 1];
+      }
+      break;
+    }
+    case aff_flag_type::NUM: {  // decimal numbers separated by comma (4521,23,233 -> 4521
+                      // 23 233)
+      len = 1;
+      unsigned short* dest;
+      for (size_t i = 0; i < flags.size(); ++i) {
+        if (flags[i] == ',')
+          len++;
+      }
+      *result = (unsigned short*)malloc(len * sizeof(unsigned short));
+      if (!*result)
+        return -1;
+      dest = *result;
+      const char* src = flags.c_str();
+      for (const char* p = src; *p; p++) {
+        if (*p == ',') {
+          int i = atoi(src);
+          if (i >= DEFAULTFLAGS)
+            HUNSPELL_WARNING(
+                stderr, "error: line %d: flag id %d is too large (max: %d)\n",
+                af.getlinenum(), i, DEFAULTFLAGS - 1);
+          *dest = (unsigned short)i;
+          if (*dest == 0)
+            HUNSPELL_WARNING(stderr, "error: line %d: 0 is wrong flag id\n",
+                             af.getlinenum());
+          src = p + 1;
+          dest++;
+        }
+      }
+      int i = atoi(src);
+      if (i >= DEFAULTFLAGS)
+        HUNSPELL_WARNING(stderr,
+                         "error: line %d: flag id %d is too large (max: %d)\n",
+                         af.getlinenum(), i, DEFAULTFLAGS - 1);
+      *dest = (unsigned short)i;
+      if (*dest == 0)
+        HUNSPELL_WARNING(stderr, "error: line %d: 0 is wrong flag id\n",
+                         af.getlinenum());
+      break;
+    }
+    case aff_flag_type::UNI: {  // UTF-8 characters
+      std::vector<w_char> w;
+      u8_u16(w, flags);
+      len = w.size();
+      *result = (unsigned short*)malloc(len * sizeof(unsigned short));
+      if (!*result)
+        return -1;
+      memcpy(*result, &w[0], len * sizeof(short));
+      break;
+    }
+    default: {  // Ispell's one-character flags (erfg -> e r f g)
+      unsigned short* dest;
+      len = flags.size();
+      *result = (unsigned short*)malloc(len * sizeof(unsigned short));
+      if (!*result)
+        return -1;
+      dest = *result;
+      for (size_t i = 0; i < flags.size(); ++i) {
+        *dest = (unsigned char)flags[i];
+        dest++;
+      }
+    }
+  }
+  return len;
+}
+
+int AffixMgr::is_aliasf() const {
+  return (aliasf != NULL);
+}
+
+int AffixMgr::is_aliasm() const {
+  return (aliasm != NULL);
+}
+
+char* AffixMgr::get_aliasm(int index) const {
+  if ((index > 0) && (index <= numaliasm))
+    return aliasm[index - 1];
+  HUNSPELL_WARNING(stderr, "error: bad morph. alias index: %d\n", index);
+  return NULL;
+}
+
+bool AffixMgr::decode_flags(std::vector<unsigned short>& result, const std::string& flags, DataMgr& af) const {
+  if (flags.empty()) {
+    return false;
+  }
+  switch (aff_flag_mode) {
+    case aff_flag_type::LONG: {  // two-character flags (1x2yZz -> 1x 2y Zz)
+      size_t len = flags.size();
+      if (len % 2 == 1)
+        HUNSPELL_WARNING(stderr, "error: line %d: bad flagvector\n",
+                         af.getlinenum());
+      len /= 2;
+      result.reserve(result.size() + len);
+      for (size_t i = 0; i < len; ++i) {
+        result.push_back(((unsigned short)((unsigned char)flags[i * 2]) << 8) +
+                         (unsigned char)flags[i * 2 + 1]);
+      }
+      break;
+    }
+    case aff_flag_type::NUM: {  // decimal numbers separated by comma (4521,23,233 -> 4521
+                      // 23 233)
+      const char* src = flags.c_str();
+      for (const char* p = src; *p; p++) {
+        if (*p == ',') {
+          int i = atoi(src);
+          if (i >= DEFAULTFLAGS)
+            HUNSPELL_WARNING(
+                stderr, "error: line %d: flag id %d is too large (max: %d)\n",
+                af.getlinenum(), i, DEFAULTFLAGS - 1);
+          result.push_back((unsigned short)i);
+          if (result.back() == 0)
+            HUNSPELL_WARNING(stderr, "error: line %d: 0 is wrong flag id\n",
+                             af.getlinenum());
+          src = p + 1;
+        }
+      }
+      int i = atoi(src);
+      if (i >= DEFAULTFLAGS)
+        HUNSPELL_WARNING(stderr,
+                         "error: line %d: flag id %d is too large (max: %d)\n",
+                         af.getlinenum(), i, DEFAULTFLAGS - 1);
+      result.push_back((unsigned short)i);
+      if (result.back() == 0)
+        HUNSPELL_WARNING(stderr, "error: line %d: 0 is wrong flag id\n",
+                         af.getlinenum());
+      break;
+    }
+    case aff_flag_type::UNI: {  // UTF-8 characters
+      std::vector<w_char> w;
+      u8_u16(w, flags);
+      size_t len = w.size();
+      size_t origsize = result.size();
+      result.resize(origsize + len);
+      memcpy(&result[origsize], &w[0], len * sizeof(short));
+      break;
+    }
+    default: {  // Ispell's one-character flags (erfg -> e r f g)
+      result.reserve(flags.size());
+      for (size_t i = 0; i < flags.size(); ++i) {
+        result.push_back((unsigned char)flags[i]);
+      }
+    }
+  }
+  return true;
+}
+
+unsigned short AffixMgr::decode_flag(const char* f) const {
+  unsigned short s = 0;
+  int i;
+  switch (aff_flag_mode) {
+    case aff_flag_type::LONG:
+      s = ((unsigned short)((unsigned char)f[0]) << 8) + (unsigned char)f[1];
+      break;
+    case aff_flag_type::NUM:
+      i = atoi(f);
+      if (i >= DEFAULTFLAGS)
+        HUNSPELL_WARNING(stderr, "error: flag id %d is too large (max: %d)\n",
+                         i, DEFAULTFLAGS - 1);
+      s = (unsigned short)i;
+      break;
+    case aff_flag_type::UNI: {
+      std::vector<w_char> w;
+      u8_u16(w, f);
+      if (!w.empty())
+          memcpy(&s, &w[0], 1 * sizeof(short));
+      break;
+    }
+    default:
+      s = *(unsigned char*)f;
+  }
+  if (s == 0)
+    HUNSPELL_WARNING(stderr, "error: 0 is wrong flag id\n");
+  return s;
+}
+
+char* AffixMgr::encode_flag(unsigned short f) const {
+  if (f == 0)
+    return mystrdup("(NULL)");
+  std::string ch;
+  if (aff_flag_mode == aff_flag_type::LONG) {
+    ch.push_back((unsigned char)(f >> 8));
+    ch.push_back((unsigned char)(f - ((f >> 8) << 8)));
+  } else if (aff_flag_mode == aff_flag_type::NUM) {
+    std::ostringstream stream;
+    stream << f;
+    ch = stream.str();
+  } else if (aff_flag_mode == aff_flag_type::UNI) {
+    const w_char* w_c = (const w_char*)&f;
+    std::vector<w_char> w(w_c, w_c + 1);
+    u16_u8(ch, w);
+  } else {
+    ch.push_back((unsigned char)(f));
+  }
+  return mystrdup(ch.c_str());
 }

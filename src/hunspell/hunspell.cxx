@@ -87,7 +87,7 @@
 class HunspellImpl
 {
 public:
-  HunspellImpl(const char* affpath, const char* dpath, const char* key = NULL);
+  HunspellImpl(const char* affpath, const char* dpath, const char* key = NULL, int aff_data_len = 0, int dic_data_len = 0);
   ~HunspellImpl();
   int add_dic(const char* dpath, const char* key = NULL);
   std::vector<std::string> suffix_suggest(const std::string& root_word);
@@ -127,7 +127,6 @@ private:
   AffixMgr* pAMgr;
   std::vector<HashMgr*> m_HMgrs;
   SuggestMgr* pSMgr;
-  char* affixpath;
   std::string encoding;
   struct cs_info* csconv;
   int langnum;
@@ -169,18 +168,16 @@ private:
   HunspellImpl& operator=(const HunspellImpl&);
 };
 
-HunspellImpl::HunspellImpl(const char* affpath, const char* dpath, const char* key) {
+HunspellImpl::HunspellImpl(const char* affpath, const char* dpath, const char* key, int aff_data_len, int dic_data_len) {
   csconv = NULL;
   utf8 = 0;
   complexprefixes = 0;
-  affixpath = mystrdup(affpath);
 
-  /* first set up the hash manager */
-  m_HMgrs.push_back(new HashMgr(dpath, affpath, key));
+  /* first set up the affix manager */
+  pAMgr = new AffixMgr(affpath, m_HMgrs, key, aff_data_len);
 
-  /* next set up the affix manager */
-  /* it needs access to the hash manager lookup methods */
-  pAMgr = new AffixMgr(affpath, m_HMgrs, key);
+  /* next set up the hash manager */
+  m_HMgrs.push_back(new HashMgr(dpath, *pAMgr, key, dic_data_len));
 
   /* get the preferred try string and the dictionary */
   /* encoding from the Affix Manager for that dictionary */
@@ -199,27 +196,24 @@ HunspellImpl::HunspellImpl(const char* affpath, const char* dpath, const char* k
     free(try_string);
 }
 
-HunspellImpl::~HunspellImpl() {
-  delete pSMgr;
-  delete pAMgr;
+HunspellImpl::~HunspellImpl() {  
   for (size_t i = 0; i < m_HMgrs.size(); ++i)
     delete m_HMgrs[i];
+  delete pSMgr;
+  delete pAMgr;
   pSMgr = NULL;
   pAMgr = NULL;
 #ifdef MOZILLA_CLIENT
   delete[] csconv;
 #endif
   csconv = NULL;
-  if (affixpath)
-    free(affixpath);
-  affixpath = NULL;
 }
 
 // load extra dictionaries
 int HunspellImpl::add_dic(const char* dpath, const char* key) {
-  if (!affixpath)
+  if (!pAMgr)
     return 1;
-  m_HMgrs.push_back(new HashMgr(dpath, affixpath, key));
+  m_HMgrs.push_back(new HashMgr(dpath, *pAMgr, key));
   return 0;
 }
 
@@ -2023,8 +2017,8 @@ int HunspellImpl::input_conv(const char* word, char* dest, size_t destsize) {
   return 0;
 }
 
-Hunspell::Hunspell(const char* affpath, const char* dpath, const char* key)
-  : m_Impl(new HunspellImpl(affpath, dpath, key)) {
+Hunspell::Hunspell(const char* affpath, const char* dpath, const char* key, int aff_data_len, int dic_data_len)
+  : m_Impl(new HunspellImpl(affpath, dpath, key, aff_data_len, dic_data_len)) {
 }
 
 Hunspell::~Hunspell() {

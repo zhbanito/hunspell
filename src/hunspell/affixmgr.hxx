@@ -88,6 +88,9 @@
 
 class PfxEntry;
 class SfxEntry;
+class HashMgr;
+
+enum aff_flag_type { CHAR, LONG, NUM, UNI };
 
 class AffixMgr {
   PfxEntry* pStart[SETSIZE];
@@ -173,8 +176,19 @@ class AffixMgr {
   char contclasses[CONTSIZE];  // flags of possible continuing classes (twofold
                                // affix)
 
+  aff_flag_type aff_flag_mode;
+  int numaliasf;  // flag vector `compression' with aliases
+  unsigned short** aliasf;
+  unsigned short* aliasflen;
+  int numaliasm;  // morphological desciption `compression' with aliases
+  char** aliasm;
+  // reptable created from REP table of aff file and from "ph:" fields
+  // of the dic file. It contains phonetic and other common misspellings
+  // (letters, letter groups and words) for better suggestions
+  std::vector<replentry> reptable;
+
  public:
-  AffixMgr(const char* affpath, const std::vector<HashMgr*>& ptr, const char* key = NULL);
+  AffixMgr(const char* affpath, const std::vector<HashMgr*>& ptr, const char* key = NULL, int aff_data_len = 0);
   ~AffixMgr();
   struct hentry* affix_check(const char* word,
                              int len,
@@ -291,7 +305,6 @@ class AffixMgr {
                        const char* root_word);
 
   struct hentry* lookup(const char* word);
-  const std::vector<replentry>& get_reptable() const;
   RepList* get_iconvtable() const;
   RepList* get_oconvtable() const;
   struct phonetable* get_phonetable() const;
@@ -332,22 +345,36 @@ class AffixMgr {
   int get_checksharps(void) const;
   char* encode_flag(unsigned short aflag) const;
   int get_fullstrip() const;
+  
+  int get_aliasf(int index, unsigned short** fvec, DataMgr& af) const;
+  int decode_flags(unsigned short** result, const std::string& flags, DataMgr& af) const;
+  bool decode_flags(std::vector<unsigned short>& result, const std::string& flags, DataMgr& af) const;
+  unsigned short decode_flag(const char* flag) const;
+  int is_aliasf() const;
+  int is_aliasm() const;
+  char* get_aliasm(int index) const;
+  std::vector<replentry>& get_reptable();
 
  private:
   int parse_file(const char* affpath, const char* key);
-  bool parse_flag(const std::string& line, unsigned short* out, FileMgr* af);
-  bool parse_num(const std::string& line, int* out, FileMgr* af);
-  bool parse_cpdsyllable(const std::string& line, FileMgr* af);
+  int parse_file(const char* aff_data, int aff_data_len);
+  int parse_file(DataMgr& afflst);
+  bool parse_flag(const std::string& line, unsigned short* out, DataMgr& af);
+  bool parse_num(const std::string& line, int* out, DataMgr& af);
+  bool parse_cpdsyllable(const std::string& line, DataMgr& af);
   bool parse_convtable(const std::string& line,
-                      FileMgr* af,
+                      DataMgr& af,
                       RepList** rl,
                       const std::string& keyword);
-  bool parse_phonetable(const std::string& line, FileMgr* af);
-  bool parse_maptable(const std::string& line, FileMgr* af);
-  bool parse_breaktable(const std::string& line, FileMgr* af);
-  bool parse_checkcpdtable(const std::string& line, FileMgr* af);
-  bool parse_defcpdtable(const std::string& line, FileMgr* af);
-  bool parse_affix(const std::string& line, const char at, FileMgr* af, char* dupflags);
+  bool parse_phonetable(const std::string& line, DataMgr& af);
+  bool parse_maptable(const std::string& line, DataMgr& af);
+  bool parse_breaktable(const std::string& line, DataMgr& af);
+  bool parse_checkcpdtable(const std::string& line, DataMgr& af);
+  bool parse_defcpdtable(const std::string& line, DataMgr& af);
+  bool parse_affix(const std::string& line, const char at, DataMgr& af, char* dupflags);
+  bool parse_aliasf(const std::string& line, DataMgr& af);
+  bool parse_aliasm(const std::string& line, DataMgr& af);
+  bool parse_reptable(const std::string& line, DataMgr& af);
 
   void reverse_condition(std::string&);
   std::string& debugflag(std::string& result, unsigned short flag);
@@ -362,7 +389,7 @@ class AffixMgr {
   int process_pfx_tree_to_list();
   int process_sfx_tree_to_list();
   int redundant_condition(char, const char* strip, int stripl, const char* cond, int);
-  void finishFileMgr(FileMgr* afflst);
+  
 };
 
 #endif
